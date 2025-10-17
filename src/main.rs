@@ -105,8 +105,8 @@ fn main() {
     
     // Add rendering optimization flags for best performance
     args.push_str(" --use-angle=d3d11"); // Force D3D11 backend
-    args.push_str(" --disable-features=CalculateNativeWinOcclusion"); // Prevent background throttling
     args.push_str(" --disable-gpu-vsync"); // Allow tearing/VRR properly
+    args.push_str(" --disable-features=CalculateNativeWinOcclusion"); // Prevent background throttling
 
     if config.lock().unwrap().get("discordRPC").unwrap_or(false) {
         let mut client = DiscordIpcClient::new(constants::DISCORD_CLIENT_ID);

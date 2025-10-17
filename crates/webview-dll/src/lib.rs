@@ -150,9 +150,16 @@ fn attach() {
         WINDOW_HANDLE.store(handle_ptr, std::sync::atomic::Ordering::Relaxed);
         let chrome_windows = ChromeWindows::get(parent);
         chrome_windows.set_window_procs();
+        
+        // Register raw input for low-latency mouse
+        register_raw_mouse(parent, true);
 
         std::thread::spawn(move || {
             THREAD_ID.store(GetCurrentThreadId(), std::sync::atomic::Ordering::Relaxed);
+            
+            // Enable MMCSS for input thread
+            enable_input_thread_mmcss();
+            
             let mut msg: MSG = MSG::default();
             // check whenever a window is created if it has the attribute Chrome.WindowTranslucent (the one that warns about pointer lock) and if it does, destroy it
             let hook = SetWinEventHook(
@@ -246,24 +253,22 @@ unsafe extern "system" fn wnd_proc_1(
                 CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam)
             }
             WM_INPUT => {
-                let raw_input_handle = HRAWINPUT(lparam.0 as _);
-                let mut buffer: [u8; 48] = [0; 48];
-                let mut size = 48;
-
-                GetRawInputData(
-                    raw_input_handle,
-                    RID_INPUT,
-                    Some(buffer.as_mut_ptr() as _),
-                    &mut size,
-                    std::mem::size_of::<RAWINPUTHEADER>() as u32,
-                );
-
-                let raw_input = buffer.as_mut_ptr() as *mut RAWINPUT;
-
-                if (*raw_input).data.mouse.Anonymous.Anonymous.usButtonFlags != 0 {
-                    return LRESULT(1);
-                }
-                CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam)
+                // Use efficient batched reading for all queued input (telemetry/monitoring)
+                drain_raw_input_buffer(|rip| {
+                    if rip.header.dwType == RIM_TYPEMOUSE.0 {
+                        handle_raw_mouse(&rip.data.mouse);
+                    }
+                });
+                
+                // Always forward to Chromium since we're not using RIDEV_NOLEGACY
+                // Both raw input (for telemetry) and legacy WM_MOUSE* (for Chromium) coexist
+                return CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam);
+            }
+            0x00FE => { // WM_INPUT_DEVICE_CHANGE
+                // wparam: GIDC_ARRIVAL (1) or GIDC_REMOVAL (2)
+                // lparam: HANDLE to the device
+                // Could refresh cached device info with GetRawInputDeviceInfo here
+                return LRESULT(0);
             }
             _ => CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam),
         }
@@ -285,13 +290,19 @@ unsafe extern "system" fn wnd_proc_widget(
                 LRESULT(1)
             }
             WM_USER => {
-                LOCK_STATUS.store(wparam.0 != 0, std::sync::atomic::Ordering::Relaxed);
+                let locked = wparam.0 != 0;
+                LOCK_STATUS.store(locked, std::sync::atomic::Ordering::Relaxed);
+                
+                // NOTE: Not switching to NOLEGACY mode yet - need to implement delta forwarding first
+                // Currently keeping legacy WM_MOUSE* messages enabled so Chromium continues to work
+                // TODO: Re-enable dynamic mode switching once raw delta forwarding to JS is implemented
+                
                 LRESULT(1)
             }
             WM_MOUSEWHEEL => {
                 if LOCK_STATUS.load(std::sync::atomic::Ordering::Relaxed) {
                     let glorp = WINDOW_HANDLE.load(std::sync::atomic::Ordering::Relaxed);
-                    // send the message to the glorp window, from where it gets sent as a js event, best fix i could find for the fps dropping when scrolling whilst still keeping scroll behaviour intact
+                    // Forward to main window for JS event processing
                     PostMessageW(Some(*glorp), message, wparam, lparam).ok();
                     return LRESULT(1);
                 }
@@ -340,6 +351,232 @@ unsafe extern "system" fn window_event_proc(
         let prop = GetPropW(hwnd, w!("Chrome.WindowTranslucent"));
         if !prop.is_invalid() {
             PostMessageW(Some(hwnd), WM_DESTROY, WPARAM(0), LPARAM(0)).ok();
+        }
+    }
+}
+
+// ---------- Raw Input Setup ----------
+
+/// Call this once at startup with unlocked mode
+unsafe fn register_raw_mouse(hwnd: HWND, background: bool) {
+    unsafe { register_raw_mouse_mode(hwnd, background, false) };
+}
+
+/// Register raw mouse input with dynamic mode switching
+/// nolegacy=true: suppress WM_MOUSE* (pointer lock, low latency)
+/// nolegacy=false: allow WM_MOUSE* (normal Chromium input)
+unsafe fn register_raw_mouse_mode(hwnd: HWND, background: bool, nolegacy: bool) {
+    use windows::Win32::UI::Input::*;
+    
+    let mut flags = RIDEV_DEVNOTIFY; // Always get device change notifications
+    
+    if background {
+        flags |= RIDEV_INPUTSINK; // Receive input even when not in foreground
+    }
+    
+    if nolegacy {
+        // POINTER LOCK MODE: Suppress legacy WM_MOUSE* for lowest latency
+        flags |= RIDEV_NOLEGACY; // No WM_MOUSEMOVE, WM_LBUTTONDOWN, etc.
+        unsafe { OutputDebugStringW(w!("Raw input: NOLEGACY mode (pointer locked)\0")); }
+    } else {
+        // NORMAL MODE: Allow legacy messages for Chromium
+        unsafe { OutputDebugStringW(w!("Raw input: Legacy mode (Chromium input)\0")); }
+    }
+    
+    let rid = RAWINPUTDEVICE {
+        usUsagePage: 0x01, // HID_USAGE_PAGE_GENERIC
+        usUsage: 0x02,     // HID_USAGE_GENERIC_MOUSE
+        dwFlags: flags,
+        hwndTarget: hwnd,
+    };
+    
+    unsafe {
+        match RegisterRawInputDevices(&[rid], std::mem::size_of::<RAWINPUTDEVICE>() as u32) {
+            Ok(_) => {
+                // Success - mode switched
+            }
+            Err(e) => {
+                let msg = format!("Failed to register raw input mode: {:?}\0", e);
+                let wide: Vec<u16> = msg.encode_utf16().collect();
+                OutputDebugStringW(PCWSTR(wide.as_ptr()));
+            }
+        }
+    }
+}
+
+/// Read raw input data with correct buffer sizing (single message)
+#[allow(dead_code)]
+unsafe fn read_raw_input(lparam: LPARAM) -> Option<RAWINPUT> {
+    use windows::Win32::UI::Input::*;
+    
+    let hraw = HRAWINPUT(lparam.0 as _);
+    let mut size: u32 = 0;
+    
+    // First call: query size
+    unsafe {
+        GetRawInputData(
+            hraw,
+            RID_INPUT,
+            None,
+            &mut size,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        );
+    }
+    
+    if size == 0 {
+        return None;
+    }
+    
+    // Allocate buffer with correct size
+    let mut buf = vec![0u8; size as usize];
+    let got = unsafe {
+        GetRawInputData(
+            hraw,
+            RID_INPUT,
+            Some(buf.as_mut_ptr() as _),
+            &mut size,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    
+    if got == u32::MAX || got == 0 {
+        return None;
+    }
+    
+    // SAFETY: buffer contains a valid RAWINPUT structure
+    unsafe { Some(*(buf.as_ptr() as *const RAWINPUT)) }
+}
+
+// Reusable thread-local buffer to avoid allocations on each message
+thread_local! {
+    static RAWBUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain all queued raw input using GetRawInputBuffer (more efficient than one-by-one)
+unsafe fn drain_raw_input_buffer(mut handle_one: impl FnMut(&RAWINPUT)) {
+    use windows::Win32::UI::Input::*;
+    
+    // Step 1: Query required size (in bytes) for all queued RAWINPUTs
+    let mut bytes_needed: u32 = 0;
+    unsafe {
+        GetRawInputBuffer(
+            None,
+            &mut bytes_needed,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        );
+    }
+    
+    if bytes_needed == 0 {
+        return;
+    }
+    
+    RAWBUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < bytes_needed as usize {
+            buf.resize(bytes_needed as usize, 0);
+        }
+        
+        // Step 2: Fetch all RAWINPUTs
+        let mut struct_count = (buf.len() / std::mem::size_of::<RAWINPUT>()) as u32;
+        let got = unsafe {
+            GetRawInputBuffer(
+                Some(buf.as_mut_ptr() as *mut RAWINPUT),
+                &mut struct_count,
+                std::mem::size_of::<RAWINPUTHEADER>() as u32,
+            )
+        };
+        
+        if got == u32::MAX || got == 0 {
+            return;
+        }
+        
+        // Step 3: Iterate through each RAWINPUT structure
+        let mut offset = 0usize;
+        for _ in 0..got {
+            unsafe {
+                let rip: &RAWINPUT = &*(buf.as_ptr().add(offset) as *const RAWINPUT);
+                handle_one(rip);
+                // Advance to next RAWINPUT using dwSize
+                offset += rip.header.dwSize as usize;
+            }
+        }
+    });
+}
+
+/// Drain all WM_INPUT messages from the queue (call before present)
+#[allow(dead_code)]
+unsafe fn pump_all_rawinput(hwnd: HWND) {
+    use windows::Win32::UI::Input::*;
+    
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    // Drain only WM_INPUT messages to minimize latency
+    while unsafe { PeekMessageW(&mut msg, Some(hwnd), WM_INPUT, WM_INPUT, PM_REMOVE) }.into() {
+        // Process using buffered read
+        unsafe {
+            drain_raw_input_buffer(|rip| {
+                if rip.header.dwType == RIM_TYPEMOUSE.0 {
+                    handle_raw_mouse(&rip.data.mouse);
+                }
+            });
+        }
+    }
+}
+
+/// Handle a single raw mouse input sample
+unsafe fn handle_raw_mouse(mouse: &RAWMOUSE) {
+    let button_flags = unsafe { mouse.Anonymous.Anonymous.usButtonFlags };
+    
+    // Handle wheel input first (even when not locked, for consistency)
+    if (button_flags & RI_MOUSE_WHEEL as u16) != 0 {
+        let wheel_delta = unsafe { (mouse.Anonymous.Anonymous.usButtonData as i16) as i32 };
+        // Forward vertical wheel delta (multiples of WHEEL_DELTA = 120)
+        // This is where you'd send the wheel event to JS/game layer
+        
+        if LOCK_STATUS.load(std::sync::atomic::Ordering::Relaxed) {
+            // During pointer lock, use the SCROLL_SENDER for ramp boost
+            if wheel_delta != 0 {
+                SCROLL_SENDER.send(()).ok();
+            }
+        }
+    }
+    
+    if (button_flags & RI_MOUSE_HWHEEL as u16) != 0 {
+        let _hwheel_delta = unsafe { (mouse.Anonymous.Anonymous.usButtonData as i16) as i32 };
+        // Forward horizontal wheel delta if needed
+    }
+    
+    // Check if this is relative motion (typical for mice)
+    let is_relative = (mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0) == 0;
+    if is_relative && LOCK_STATUS.load(std::sync::atomic::Ordering::Relaxed) {
+        let dx = mouse.lLastX;
+        let dy = mouse.lLastY;
+        
+        // Ignore if no actual motion
+        if dx != 0 || dy != 0 {
+            // Forward dx, dy to game/JS layer here
+            // This is where you'd inject into your input pipeline
+            // Raw input provides these deltas without coalescing
+        }
+    }
+}
+
+/// Enable MMCSS scheduling for the input thread
+unsafe fn enable_input_thread_mmcss() {
+    #[link(name = "Avrt")]
+    unsafe extern "system" {
+        fn AvSetMmThreadCharacteristicsW(task_name: PCWSTR, task_index: *mut u32) -> HANDLE;
+        fn AvSetMmThreadPriority(avrt_handle: HANDLE, priority: i32) -> BOOL;
+    }
+    
+    let task_name: Vec<u16> = "Games".encode_utf16().chain(Some(0)).collect();
+    let mut task_index = 0u32;
+    let handle = unsafe { AvSetMmThreadCharacteristicsW(PCWSTR(task_name.as_ptr()), &mut task_index) };
+    
+    if !handle.is_invalid() {
+        unsafe {
+            let _ = AvSetMmThreadPriority(handle, 1); // AVRT_PRIORITY_HIGH
+            SetThreadPriorityBoost(GetCurrentThread(), true).ok(); // Disable dynamic boost for consistency
+            OutputDebugStringW(w!("Input thread MMCSS enabled\0"));
         }
     }
 }
