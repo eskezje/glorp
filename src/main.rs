@@ -13,6 +13,8 @@ use windows::{
     Win32::{Foundation::*, System::Com::*, UI::WindowsAndMessaging::*},
     core::*,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessInformation, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling};
+
 
 mod config;
 mod constants;
@@ -44,6 +46,21 @@ fn main() {
         modules::lifecycle::installer_cleanup().ok();
     }
     modules::lifecycle::register_instance();
+
+    unsafe {
+        let throttling_state = PROCESS_POWER_THROTTLING_STATE {
+            Version: 1,
+            ControlMask: 0x1,
+            StateMask: 0,
+        };
+        
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &throttling_state as *const _ as *const _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        ).ok();
+    }
 
     let client_dir: String = std::env::var("USERPROFILE").unwrap() + "\\Documents\\glorp";
     let swap_dir = String::from(&client_dir) + "\\swapper";
