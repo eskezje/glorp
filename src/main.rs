@@ -26,6 +26,7 @@ mod modules {
     pub mod priority;
     pub mod swapper;
     pub mod userscripts;
+    pub mod mmcss;
 }
 
 static LAUNCH_ARGS: Lazy<Arc<Mutex<Vec<String>>>> =
@@ -122,6 +123,16 @@ fn main() {
         main_window.webview.BrowserProcessId(&mut webview_pid).ok();
 
         println!("Webview PID: {}", webview_pid);
+        
+        // Apply MMCSS to webview process if enabled
+        if config.lock().unwrap().get("mmcss").unwrap_or(true) {
+            if let Err(e) = modules::mmcss::register_webview_process(webview_pid, "Games") {
+                eprintln!("Failed to register MMCSS: {}", e);
+            } else {
+                println!("MMCSS enabled for Games task class");
+            }
+        }
+        
         #[cfg(feature = "packaged")]
         {
             if config.lock().unwrap().get("checkUpdates").unwrap_or(false) {
