@@ -5,6 +5,11 @@ description = "krunker"
 authors = ["slav"]
 edition = "2024"
 
+[lib]
+name = "glorp_renderhook"
+crate-type = ["cdylib"]
+path = "src/renderhook.rs"
+
 [workspace]
 members = ["crates/*"]
 
@@ -24,6 +29,7 @@ packaged = []
 editor-ignore = []
 
 [dependencies]
+minhook = "0.8"
 windows = { version = "0.61.*", features = [
        "Win32_UI_WindowsAndMessaging",
        "Win32_UI_Input_KeyboardAndMouse",
@@ -43,6 +49,11 @@ windows = { version = "0.61.*", features = [
        "Win32_Security_Authorization",
        "Win32_System_DataExchange",
        "Win32_System_Power",
+       "Win32_Media_Audio",
+       "Win32_Graphics_Dxgi",
+       "Win32_Graphics_Dxgi_Common",
+       "Win32_Graphics_Direct3D",
+       "Win32_Graphics_Direct3D11",
 ] }
 
 webview2-com = { version = "0.38.*", default-features = false }

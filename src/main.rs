@@ -29,6 +29,7 @@ mod modules {
     pub mod swapper;
     pub mod userscripts;
     pub mod mmcss;
+    pub mod inject;
 }
 
 static LAUNCH_ARGS: Lazy<Arc<Mutex<Vec<String>>>> =
@@ -138,6 +139,20 @@ fn main() {
 
         let mut webview_pid: u32 = 0;
         main_window.webview.BrowserProcessId(&mut webview_pid).ok();
+
+        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let hook_dll = exe_dir.join("glorp_renderhook.dll"); // produced by the [lib] target we added
+
+        // (Optional) make sure DLL exists (build step must have produced it)
+        if std::fs::metadata(&hook_dll).is_ok() {
+            if let Err(e) = modules::inject::inject_into_child_gpu_process(webview_pid, hook_dll.to_str().unwrap()) {
+                eprintln!("DLL inject failed: {e:?}");
+            } else {
+                println!("Injected hook into GPU process.");
+            }
+        } else {
+            eprintln!("Hook DLL not found at {:?}", hook_dll);
+        }
 
         println!("Webview PID: {}", webview_pid);
         
