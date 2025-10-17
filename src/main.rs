@@ -48,11 +48,12 @@ fn main() {
     }
     modules::lifecycle::register_instance();
 
+    // Disable power throttling for best performance
     unsafe {
         let throttling_state = PROCESS_POWER_THROTTLING_STATE {
             Version: 1,
-            ControlMask: 0x1,
-            StateMask: 0,
+            ControlMask: 0x1, // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            StateMask: 0,     // 0 = disable throttling
         };
         
         SetProcessInformation(
@@ -99,8 +100,13 @@ fn main() {
     let discord_client: Mutex<Option<DiscordIpcClient>> = Mutex::new(None);
 
     if config.lock().unwrap().get("uncapFps").unwrap_or(true) {
-        args.push_str("--disable-frame-rate-limit")
+        args.push_str(" --disable-frame-rate-limit")
     }
+    
+    // Add rendering optimization flags for best performance
+    args.push_str(" --use-angle=d3d11"); // Force D3D11 backend
+    args.push_str(" --disable-features=CalculateNativeWinOcclusion"); // Prevent background throttling
+    args.push_str(" --disable-gpu-vsync"); // Allow tearing/VRR properly
 
     if config.lock().unwrap().get("discordRPC").unwrap_or(false) {
         match DiscordIpcClient::new(constants::DISCORD_CLIENT_ID) {
@@ -155,6 +161,16 @@ fn main() {
         }
 
         println!("Webview PID: {}", webview_pid);
+        
+        // Apply power throttling disable to webview process
+        if let Err(e) = modules::mmcss::disable_process_power_throttling(webview_pid) {
+            eprintln!("Failed to disable webview power throttling: {}", e);
+        }
+        
+        // Enable DWM MMCSS scheduling (system-wide optimization)
+        if let Err(e) = modules::mmcss::enable_dwm_mmcss() {
+            eprintln!("Failed to enable DWM MMCSS: {}", e);
+        }
         
         // Apply MMCSS to webview process if enabled
         if config.lock().unwrap().get("mmcss").unwrap_or(true) {

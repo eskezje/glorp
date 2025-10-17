@@ -4,6 +4,7 @@ use windows::{
     Win32::{
         Foundation::*,
         System::Threading::*,
+        Graphics::Dwm::*,
     },
 };
 
@@ -123,10 +124,59 @@ pub fn register_webview_process(webview_pid: u32, task_class: &str) -> Result<()
     Ok(())
 }
 
+/// Enable DWM (Desktop Window Manager) to participate in MMCSS scheduling
+/// This is a system-wide optimization that reduces DWM composition latency
+pub fn enable_dwm_mmcss() -> Result<()> {
+    unsafe {
+        DwmEnableMMCSS(true)?;
+        println!("Enabled DWM MMCSS scheduling");
+        Ok(())
+    }
+}
+
 /// Apply MMCSS to the current thread
 #[allow(dead_code)]
 pub fn apply_to_current_thread(task_class: &str, priority: MmcssPriority) -> Result<MmcssHandle> {
     let handle = MmcssHandle::register(task_class)?;
     handle.set_priority(priority)?;
+    
+    // Disable dynamic priority boost for consistent scheduling
+    unsafe {
+        SetThreadPriorityBoost(GetCurrentThread(), true).ok(); // TRUE = disable boost
+    }
+    
     Ok(handle)
+}
+
+/// Apply power throttling disable to a specific process
+#[allow(dead_code)]
+pub fn disable_process_power_throttling(pid: u32) -> Result<()> {
+    unsafe {
+        let process_handle = OpenProcess(
+            PROCESS_SET_INFORMATION,
+            false,
+            pid,
+        )?;
+        
+        let throttling_state = PROCESS_POWER_THROTTLING_STATE {
+            Version: 1,
+            ControlMask: 0x1, // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            StateMask: 0,     // 0 = disable throttling
+        };
+        
+        use windows::Win32::System::Threading::{SetProcessInformation, ProcessPowerThrottling, PROCESS_POWER_THROTTLING_STATE};
+        
+        if SetProcessInformation(
+            process_handle,
+            ProcessPowerThrottling,
+            &throttling_state as *const _ as *const _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        ).is_ok() {
+            println!("Disabled power throttling for process {}", pid);
+        }
+        
+        CloseHandle(process_handle).ok();
+    }
+    
+    Ok(())
 }

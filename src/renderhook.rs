@@ -72,6 +72,8 @@ fn ensure_mmcss_games_high() {
             if !cookie.is_invalid() {
                 unsafe {
                     let _ = AvSetMmThreadPriority(cookie, AVRT_PRIORITY_HIGH);
+                    // Disable dynamic priority boost for consistent scheduling
+                    SetThreadPriorityBoost(GetCurrentThread(), true).ok();
                 }
                 tls.set(Some(cookie));
             }
@@ -84,7 +86,7 @@ fn patch_desc(desc: &mut DXGI_SWAP_CHAIN_DESC1) {
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.BufferCount = 2;
     desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE; // opaque helps independent flip
-    desc.Scaling = DXGI_SCALING_NONE;
+    desc.Scaling = DXGI_SCALING_NONE; // no scaling helps independent flip
     desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
     unsafe {
         if TEARING_SUPPORTED {
@@ -97,7 +99,9 @@ unsafe fn after_create_store_wait(this_sc: *mut *mut c_void) {
     // Don't auto-Release app's COM object
     let sc1 = ManuallyDrop::new(unsafe { IDXGISwapChain1::from_raw(*this_sc) });
     if let Ok(sc2) = (&*sc1).cast::<IDXGISwapChain2>() {
+        // Set maximum frame latency to 1 for lowest latency
         let _ = unsafe { sc2.SetMaximumFrameLatency(1) };
+        // Get the waitable object handle
         let h = unsafe { sc2.GetFrameLatencyWaitableObject() };
         // h is a HANDLE; store as usize to avoid Send/Sync problems
         WAIT_HANDLES.lock().unwrap().insert(unsafe { *this_sc as usize }, h.0 as usize);
@@ -145,11 +149,15 @@ unsafe extern "system" fn present_hk(
     // MMCSS on the actual presenter thread
     ensure_mmcss_games_high();
 
+    // CRITICAL: Wait on the waitable object BEFORE presenting
+    // This ensures queue depth = 1, minimizing latency
     if let Some(&h_usize) = WAIT_HANDLES.lock().unwrap().get(&(this as usize)) {
         let h = HANDLE(h_usize as *mut c_void);
+        // Wait until the previously-presented frame is displayed
         let _ = unsafe { WaitForSingleObjectEx(h, INFINITE, true) };
     }
 
+    // Enable tearing for VRR/uncapped when sync_interval == 0
     if unsafe { TEARING_SUPPORTED } && sync_interval == 0 {
         present_flags |= DXGI_PRESENT_ALLOW_TEARING;
     }
