@@ -109,18 +109,9 @@ fn main() {
     args.push_str(" --disable-gpu-vsync"); // Allow tearing/VRR properly
 
     if config.lock().unwrap().get("discordRPC").unwrap_or(false) {
-        match DiscordIpcClient::new(constants::DISCORD_CLIENT_ID) {
-            Ok(mut client) => {
-                if client.connect().is_ok() {
-                    *discord_client.lock().unwrap() = Some(client);
-                } else {
-                    eprintln!("Failed to connect Discord IPC");
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to create Discord IPC client: {}", e);
-            }
-        }
+        let mut client = DiscordIpcClient::new(constants::DISCORD_CLIENT_ID);
+        client.connect().ok();
+        *discord_client.lock().unwrap() = Some(client);
     }
 
     unsafe {
@@ -265,7 +256,7 @@ fn main() {
                                 .ok();
                             return Ok(());
                         }
-                        
+
                         let stream = swaps.get(filename);
                         if let Some(stream) = stream {
                             let response = env.CreateWebResourceResponse(
@@ -278,7 +269,7 @@ fn main() {
 
                             return Ok(());
                         }
-                        
+
                         for regex in &blocklist {
                             if regex.is_match(&uri) {
                                 request.SetUri(PCWSTR::null())?;
