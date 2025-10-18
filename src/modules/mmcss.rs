@@ -1,11 +1,6 @@
-// modules/mmcss.rs
 use windows::{
+    Win32::{Foundation::*, Graphics::Dwm::*, System::Threading::*},
     core::*,
-    Win32::{
-        Foundation::*,
-        System::Threading::*,
-        Graphics::Dwm::*,
-    },
 };
 
 #[link(name = "Avrt")]
@@ -36,10 +31,7 @@ impl MmcssHandle {
             let wide_name: Vec<u16> = task_name.encode_utf16().chain(Some(0)).collect();
             let mut task_index: u32 = 0;
             
-            let handle = AvSetMmThreadCharacteristicsW(
-                PCWSTR(wide_name.as_ptr()),
-                &mut task_index,
-            );
+            let handle = AvSetMmThreadCharacteristicsW(PCWSTR(wide_name.as_ptr()), &mut task_index);
             
             if handle.is_invalid() {
                 return Err(Error::from_win32());
@@ -90,11 +82,7 @@ pub enum MmcssPriority {
 /// Register the webview process with MMCSS
 pub fn register_webview_process(webview_pid: u32, task_class: &str) -> Result<()> {
     unsafe {
-        let process_handle = OpenProcess(
-            PROCESS_SET_INFORMATION,
-            false,
-            webview_pid,
-        )?;
+        let process_handle = OpenProcess(PROCESS_SET_INFORMATION, false, webview_pid)?;
         
         // Set process priority class to HIGH_PRIORITY_CLASS for better scheduling
         if SetPriorityClass(process_handle, HIGH_PRIORITY_CLASS).is_ok() {
@@ -152,11 +140,7 @@ pub fn apply_to_current_thread(task_class: &str, priority: MmcssPriority) -> Res
 #[allow(dead_code)]
 pub fn disable_process_power_throttling(pid: u32) -> Result<()> {
     unsafe {
-        let process_handle = OpenProcess(
-            PROCESS_SET_INFORMATION,
-            false,
-            pid,
-        )?;
+        let process_handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)?;
         
         let throttling_state = PROCESS_POWER_THROTTLING_STATE {
             Version: 1,
@@ -164,14 +148,18 @@ pub fn disable_process_power_throttling(pid: u32) -> Result<()> {
             StateMask: 0,     // 0 = disable throttling
         };
         
-        use windows::Win32::System::Threading::{SetProcessInformation, ProcessPowerThrottling, PROCESS_POWER_THROTTLING_STATE};
+        use windows::Win32::System::Threading::{
+            PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
+        };
         
         if SetProcessInformation(
             process_handle,
             ProcessPowerThrottling,
             &throttling_state as *const _ as *const _,
             std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
-        ).is_ok() {
+        )
+        .is_ok()
+        {
             println!("Disabled power throttling for process {}", pid);
         }
         

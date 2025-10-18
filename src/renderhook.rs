@@ -1,18 +1,18 @@
 #![allow(non_snake_case)]
 use std::{collections::HashMap, ffi::c_void, mem::ManuallyDrop, sync::Mutex};
 
-use once_cell::sync::Lazy;
 use minhook::MinHook;
+use once_cell::sync::Lazy;
 
-use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::System::Threading::*;
+use windows::core::*;
 
-use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::Graphics::Dxgi::*;
 
 // MMCSS FFI bindings
 #[link(name = "Avrt")]
@@ -24,8 +24,7 @@ unsafe extern "system" {
 const AVRT_PRIORITY_HIGH: i32 = 1;
 
 // ---------- globals ----------
-static WAIT_HANDLES: Lazy<Mutex<HashMap<usize, usize>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static WAIT_HANDLES: Lazy<Mutex<HashMap<usize, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static mut TEARING_SUPPORTED: bool = false;
 
 static mut ORIGINAL_CREATE_SC_COMP: Option<
@@ -104,7 +103,10 @@ unsafe fn after_create_store_wait(this_sc: *mut *mut c_void) {
         // Get the waitable object handle
         let h = unsafe { sc2.GetFrameLatencyWaitableObject() };
         // h is a HANDLE; store as usize to avoid Send/Sync problems
-        WAIT_HANDLES.lock().unwrap().insert(unsafe { *this_sc as usize }, h.0 as usize);
+        WAIT_HANDLES
+            .lock()
+            .unwrap()
+            .insert(unsafe { *this_sc as usize }, h.0 as usize);
         std::mem::forget(sc2);
     }
 }
@@ -117,11 +119,15 @@ unsafe extern "system" fn create_sc_for_composition_hk(
     prestricttooutput: *mut c_void,
     ppswapchain: *mut *mut c_void,
 ) -> HRESULT {
-    let Some(orig) = (unsafe { ORIGINAL_CREATE_SC_COMP }) else { return E_FAIL.into(); };
+    let Some(orig) = (unsafe { ORIGINAL_CREATE_SC_COMP }) else {
+        return E_FAIL.into();
+    };
     let mut desc = unsafe { *pdesc };
     patch_desc(&mut desc);
     let hr = unsafe { orig(this, pdevice, &desc, prestricttooutput, ppswapchain) };
-    if hr.is_ok() { unsafe { after_create_store_wait(ppswapchain) }; }
+    if hr.is_ok() {
+        unsafe { after_create_store_wait(ppswapchain) };
+    }
     hr
 }
 
@@ -132,11 +138,15 @@ unsafe extern "system" fn create_sc_for_surface_handle_hk(
     surface: HANDLE,
     ppswapchain: *mut *mut c_void,
 ) -> HRESULT {
-    let Some(orig) = (unsafe { ORIGINAL_CREATE_SC_SURFACE }) else { return E_FAIL.into(); };
+    let Some(orig) = (unsafe { ORIGINAL_CREATE_SC_SURFACE }) else {
+        return E_FAIL.into();
+    };
     let mut desc = unsafe { *pdesc };
     patch_desc(&mut desc);
     let hr = unsafe { orig(this, pdevice, &desc, surface, ppswapchain) };
-    if hr.is_ok() { unsafe { after_create_store_wait(ppswapchain) }; }
+    if hr.is_ok() {
+        unsafe { after_create_store_wait(ppswapchain) };
+    }
     hr
 }
 
@@ -162,15 +172,21 @@ unsafe extern "system" fn present_hk(
         present_flags |= DXGI_PRESENT_ALLOW_TEARING;
     }
 
-    let Some(orig) = (unsafe { ORIGINAL_PRESENT1 }) else { return E_FAIL.into(); };
+    let Some(orig) = (unsafe { ORIGINAL_PRESENT1 }) else {
+        return E_FAIL.into();
+    };
     unsafe { orig(this, sync_interval, present_flags, p_params) }
 }
 
 // ---------- install ----------
 unsafe fn install_hooks() {
     // Make a small factory to resolve vtables and tearing support once
-    let Ok(factory) = (unsafe { CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) }) else { return; };
-    
+    let Ok(factory) =
+        (unsafe { CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) })
+    else {
+        return;
+    };
+
     if let Ok(f5) = factory.cast::<IDXGIFactory5>() {
         let mut ok = BOOL(0);
         let _ = unsafe {
@@ -180,20 +196,30 @@ unsafe fn install_hooks() {
                 std::mem::size_of::<BOOL>() as u32,
             )
         };
-        unsafe { TEARING_SUPPORTED = ok.as_bool(); }
+        unsafe {
+            TEARING_SUPPORTED = ok.as_bool();
+        }
     }
 
     // Hook IDXGIFactory2::CreateSwapChainForComposition
     let create_comp_ptr =
         unsafe { (*(factory.as_raw() as *const *const c_void)).offset(15) as *mut c_void };
-    let tramp1 = unsafe { MinHook::create_hook(create_comp_ptr, create_sc_for_composition_hk as *mut c_void).unwrap() };
+    let tramp1 = unsafe {
+        MinHook::create_hook(create_comp_ptr, create_sc_for_composition_hk as *mut c_void).unwrap()
+    };
     unsafe { ORIGINAL_CREATE_SC_COMP = std::mem::transmute(tramp1) };
 
     // Hook IDXGIFactoryMedia::CreateSwapChainForCompositionSurfaceHandle
     if let Ok(fm) = factory.cast::<IDXGIFactoryMedia>() {
         let create_surface_ptr =
             unsafe { (*(fm.as_raw() as *const *const c_void)).offset(3) as *mut c_void };
-        let tramp2 = unsafe { MinHook::create_hook(create_surface_ptr, create_sc_for_surface_handle_hk as *mut c_void).unwrap() };
+        let tramp2 = unsafe {
+            MinHook::create_hook(
+                create_surface_ptr,
+                create_sc_for_surface_handle_hk as *mut c_void,
+            )
+            .unwrap()
+        };
         unsafe { ORIGINAL_CREATE_SC_SURFACE = std::mem::transmute(tramp2) };
     }
 
@@ -221,7 +247,9 @@ unsafe fn make_dummy_swapchain(factory2: &IDXGIFactory2) -> (ID3D11Device, IDXGI
             Some(&mut dev),
             None,
             None,
-        ).ok().unwrap();
+        )
+        .ok()
+        .unwrap();
     }
     let dev = dev.unwrap();
 
@@ -231,7 +259,10 @@ unsafe fn make_dummy_swapchain(factory2: &IDXGIFactory2) -> (ID3D11Device, IDXGI
         Height: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
         Stereo: BOOL(0),
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: 2,
         Scaling: DXGI_SCALING_STRETCH,
@@ -239,7 +270,11 @@ unsafe fn make_dummy_swapchain(factory2: &IDXGIFactory2) -> (ID3D11Device, IDXGI
         AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
         Flags: 0,
     };
-    let sc = unsafe { factory2.CreateSwapChainForComposition(&dev, &desc, None).unwrap() };
+    let sc = unsafe {
+        factory2
+            .CreateSwapChainForComposition(&dev, &desc, None)
+            .unwrap()
+    };
     (dev, sc)
 }
 
